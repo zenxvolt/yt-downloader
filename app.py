@@ -1,524 +1,522 @@
 import streamlit as st
 import yt_dlp
 import os
-import tempfile
-import base64
-import re
-import time
-import pandas as pd
-import plotly.express as px
 import subprocess
-from urllib.parse import urlparse, parse_qs
+import tempfile
+import threading
+import time
+import json
+from pathlib import Path
+import zipfile
+import io
+from datetime import datetime
+import re
+import sys
+import shutil
 
-# Set page config
+# Konfigurasi halaman
 st.set_page_config(
-    page_title="YouTube Downloader Pro",
-    page_icon="🎬",
+    page_title="YouTube Video Downloader Pro",
+    page_icon="📺",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for styling
+# Fungsi untuk mengecek dan setup ffmpeg
+@st.cache_resource
+def setup_ffmpeg():
+    """Setup ffmpeg untuk Streamlit Cloud"""
+    ffmpeg_path = None
+    
+    # Cek jika ffmpeg sudah tersedia di sistem
+    ffmpeg_locations = [
+        '/usr/bin/ffmpeg',
+        '/usr/local/bin/ffmpeg',
+        shutil.which('ffmpeg'),
+        './ffmpeg',  # Jika ada di direktori aplikasi
+    ]
+    
+    for location in ffmpeg_locations:
+        if location and os.path.isfile(location):
+            ffmpeg_path = location
+            break
+    
+    if not ffmpeg_path:
+        st.warning("⚠️ FFmpeg tidak terdeteksi. Beberapa fitur mungkin terbatas.")
+        return None
+    
+    return ffmpeg_path
+
+# Setup ffmpeg
+FFMPEG_PATH = setup_ffmpeg()
+
+# CSS untuk styling
 st.markdown("""
 <style>
     .main-header {
-        font-size: 2.5rem;
-        color: #FF0000;
+        background: linear-gradient(90deg, #FF0000, #FF6B6B);
+        padding: 1rem;
+        border-radius: 10px;
         text-align: center;
-        margin-bottom: 1rem;
-    }
-    .sub-header {
-        font-size: 1.5rem;
-        color: #666;
-        text-align: center;
+        color: white;
         margin-bottom: 2rem;
     }
-    .success-message {
-        padding: 1rem;
-        background-color: #d4edda;
-        color: #155724;
-        border-radius: 0.5rem;
-        margin: 1rem 0;
-    }
-    .error-message {
-        padding: 1rem;
-        background-color: #f8d7da;
-        color: #721c24;
-        border-radius: 0.5rem;
-        margin: 1rem 0;
-    }
-    .info-box {
-        background-color: #e7f3fe;
-        border-left: 6px solid #2196F3;
-        padding: 0.5rem 1rem;
-        margin: 1rem 0;
-    }
-    .download-btn {
-        background-color: #4CAF50;
-        color: white;
-        padding: 0.5rem 1rem;
-        text-align: center;
-        text-decoration: none;
-        display: inline-block;
-        font-size: 1rem;
-        border-radius: 0.3rem;
-        margin: 0.5rem 0;
-    }
     .feature-box {
-        background-color: #f8f9fa;
+        background: #f0f2f6;
         padding: 1rem;
-        border-radius: 0.5rem;
-        margin: 0.5rem 0;
-        border: 1px solid #ddd;
+        border-radius: 10px;
+        border-left: 4px solid #FF0000;
+        margin: 1rem 0;
+    }
+    .download-progress {
+        background: #e8f4fd;
+        padding: 1rem;
+        border-radius: 8px;
+        border: 1px solid #bee5eb;
+    }
+    .success-box {
+        background: #d4edda;
+        color: #155724;
+        padding: 1rem;
+        border-radius: 8px;
+        border: 1px solid #c3e6cb;
+    }
+    .error-box {
+        background: #f8d7da;
+        color: #721c24;
+        padding: 1rem;
+        border-radius: 8px;
+        border: 1px solid #f5c6cb;
     }
 </style>
 """, unsafe_allow_html=True)
 
-# Check if ffmpeg is installed
-def check_ffmpeg():
-    try:
-        # Try to run ffmpeg
-        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-        return True
-    except (subprocess.SubprocessError, FileNotFoundError):
-        return False
+# Header
+st.markdown("""
+<div class="main-header">
+    <h1>📺 YouTube Video Downloader Pro</h1>
+    <p>Download video YouTube dengan kualitas terbaik menggunakan yt-dlp & ffmpeg</p>
+</div>
+""", unsafe_allow_html=True)
 
-# Function to install yt-dlp and ffmpeg if necessary
-def setup_dependencies():
-    with st.spinner("Setting up dependencies..."):
-        # For Streamlit Cloud, we can assume yt-dlp is installed via requirements.txt
-        # Check for ffmpeg
-        if not check_ffmpeg():
-            st.warning("FFmpeg not found. Attempting to install...")
-            try:
-                # This is for Linux environments (like Streamlit Cloud)
-                subprocess.run(["apt-get", "update"], check=True)
-                subprocess.run(["apt-get", "install", "-y", "ffmpeg"], check=True)
-                st.success("FFmpeg installed successfully!")
-            except subprocess.SubprocessError:
-                st.error("Failed to install FFmpeg. Some features may not work properly.")
+# Fungsi untuk membersihkan nama file
+def sanitize_filename(filename):
+    return re.sub(r'[<>:"/\\|?*]', '_', filename)
 
-# Function to get video info
+# Fungsi untuk mendapatkan info video
+@st.cache_data(ttl=300)
 def get_video_info(url):
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'extract_flat': True,
-    }
-    
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        try:
+    try:
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             return info
-        except yt_dlp.utils.DownloadError as e:
-            st.error(f"Error: {str(e)}")
-            return None
+    except Exception as e:
+        return None
 
-# Function to download video/audio
-def download_media(url, download_type, format_id=None, quality=None, audio_only=False, 
-                   audio_format="mp3", video_format="mp4", extract_audio=False, trim=False, 
-                   start_time=None, end_time=None, filename=None, thumbnail=False):
+# Fungsi untuk mendapatkan format yang tersedia
+def get_available_formats(info):
+    formats = []
+    if 'formats' in info:
+        for f in info['formats']:
+            if f.get('height') and f.get('ext'):
+                format_info = {
+                    'format_id': f['format_id'],
+                    'ext': f['ext'],
+                    'resolution': f.get('height', 0),
+                    'fps': f.get('fps', 0),
+                    'filesize': f.get('filesize', 0),
+                    'vcodec': f.get('vcodec', 'unknown'),
+                    'acodec': f.get('acodec', 'unknown'),
+                    'format_note': f.get('format_note', ''),
+                }
+                formats.append(format_info)
+    return sorted(formats, key=lambda x: x['resolution'], reverse=True)
+
+# Fungsi progress callback
+class ProgressHook:
+    def __init__(self):
+        self.progress_bar = None
+        self.status_text = None
+        
+    def set_streamlit_elements(self, progress_bar, status_text):
+        self.progress_bar = progress_bar
+        self.status_text = status_text
     
-    # Create a temporary directory for downloads
-    temp_dir = tempfile.mkdtemp()
-    
-    # Set filename template
-    if not filename:
-        filename = "%(title)s.%(ext)s"
-    else:
-        # Ensure filename has the right extension placeholder
-        if "%(ext)s" not in filename:
-            filename += ".%(ext)s"
-    
-    output_template = os.path.join(temp_dir, filename)
-    
-    # Configure yt-dlp options based on download type
-    ydl_opts = {
-        'outtmpl': output_template,
-        'quiet': False,
-        'no_warnings': True,
-        'progress_hooks': [lambda d: update_progress(d)],
-    }
-    
-    # Add format options based on download type
-    if download_type == "video":
-        if format_id:
-            ydl_opts['format'] = format_id
-        else:
-            if quality == "best":
-                ydl_opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
-            elif quality == "medium":
-                ydl_opts['format'] = 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]'
-            elif quality == "low":
-                ydl_opts['format'] = 'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best[height<=480]'
-            
-        if video_format != "mp4":
-            ydl_opts['postprocessors'] = [{
-                'key': 'FFmpegVideoConvertor',
-                'preferedformat': video_format,
-            }]
-    
-    elif download_type == "audio":
-        if audio_only:
-            ydl_opts['format'] = 'bestaudio/best'
-            ydl_opts['postprocessors'] = [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': audio_format,
-                'preferredquality': '192',
-            }]
-    
-    elif download_type == "audio_extract":
-        ydl_opts['format'] = 'bestvideo+bestaudio/best'
-        ydl_opts['postprocessors'] = [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': audio_format,
-            'preferredquality': '192',
-        }]
-    
-    # Add thumbnail download option
-    if thumbnail:
-        ydl_opts['writethumbnail'] = True
-        ydl_opts['postprocessors'].append({
-            'key': 'FFmpegThumbnailsConvertor',
-            'format': 'jpg',
-        })
-    
-    # Download the media
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            downloaded_file = ydl.prepare_filename(info)
-            
-            # Handle extension change for audio formats
-            if download_type in ["audio", "audio_extract"]:
-                base, _ = os.path.splitext(downloaded_file)
-                downloaded_file = f"{base}.{audio_format}"
-            
-            # Trim the media if requested
-            if trim and start_time and end_time:
+    def __call__(self, d):
+        if d['status'] == 'downloading':
+            if self.progress_bar and self.status_text:
                 try:
-                    original_file = downloaded_file
-                    file_base, file_ext = os.path.splitext(original_file)
-                    trimmed_file = f"{file_base}_trimmed{file_ext}"
+                    percent = d.get('_percent_str', '0%').replace('%', '')
+                    percent_float = float(percent) / 100.0
+                    speed = d.get('_speed_str', 'N/A')
+                    eta = d.get('_eta_str', 'N/A')
                     
-                    # Convert time format if needed (e.g., "1:30" to "00:01:30")
-                    start_time_str = format_time(start_time)
-                    end_time_str = format_time(end_time)
-                    
-                    # ffmpeg command to trim
-                    trimming_status = st.empty()
-                    trimming_status.info(f"Trimming media from {start_time_str} to {end_time_str}...")
-                    
-                    ffmpeg_cmd = [
-                        "ffmpeg", "-i", original_file, 
-                        "-ss", start_time_str, "-to", end_time_str, 
-                        "-c:v", "copy", "-c:a", "copy", trimmed_file
-                    ]
-                    
-                    subprocess.run(ffmpeg_cmd, check=True)
-                    trimming_status.success("Trimming completed successfully!")
-                    
-                    # Use the trimmed file instead
-                    downloaded_file = trimmed_file
-                    
-                except subprocess.SubprocessError as e:
-                    st.error(f"Error during trimming: {str(e)}")
-            
-            return downloaded_file, info
-    except yt_dlp.utils.DownloadError as e:
-        st.error(f"Download Error: {str(e)}")
-        return None, None
+                    self.progress_bar.progress(percent_float)
+                    self.status_text.text(f"📥 Downloading: {percent}% | Speed: {speed} | ETA: {eta}")
+                except:
+                    pass
+        elif d['status'] == 'finished':
+            if self.status_text:
+                self.status_text.text("✅ Download selesai! Memproses file...")
 
-# Function to format time for ffmpeg
-def format_time(time_str):
-    # Check if time is already in HH:MM:SS format
-    if re.match(r'^\d+:\d+:\d+$', time_str):
-        return time_str
-    
-    # Check if time is in MM:SS format
-    if re.match(r'^\d+:\d+$', time_str):
-        return f"00:{time_str}"
-    
-    # Check if time is just seconds
-    if re.match(r'^\d+$', time_str):
-        seconds = int(time_str)
-        hours = seconds // 3600
-        minutes = (seconds % 3600) // 60
-        seconds = seconds % 60
-        return f"{hours:02}:{minutes:02}:{seconds:02}"
-    
-    # Default case
-    return time_str
-
-# Function to create a download link
-def get_download_link(file_path, link_text, file_type):
-    with open(file_path, "rb") as file:
-        data = file.read()
-    b64 = base64.b64encode(data).decode()
-    file_name = os.path.basename(file_path)
-    mime_type = "audio/mpeg" if file_type == "audio" else "video/mp4"
-    href = f'<a href="data:{mime_type};base64,{b64}" download="{file_name}" class="download-btn">{link_text}</a>'
-    return href
-
-# Function to update progress
-def update_progress(d):
-    if d['status'] == 'downloading':
-        try:
-            total_bytes = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
-            downloaded_bytes = d.get('downloaded_bytes', 0)
-            
-            if total_bytes > 0:
-                progress = downloaded_bytes / total_bytes
-                progress_bar.progress(progress)
-                download_status.text(f"Downloading: {d.get('_percent_str', '0%')} at {d.get('_speed_str', 'N/A')}")
-            else:
-                download_status.text(f"Downloading: {downloaded_bytes/1024/1024:.1f} MB at {d.get('_speed_str', 'N/A')}")
-        except Exception as e:
-            download_status.text(f"Downloading... {d.get('_percent_str', '')}")
-    
-    elif d['status'] == 'finished':
-        progress_bar.progress(1.0)
-        download_status.success("Download completed!")
-
-# Function to extract video ID from URL
-def extract_video_id(url):
-    parsed_url = urlparse(url)
-    
-    if parsed_url.netloc == 'youtu.be':
-        return parsed_url.path[1:]
-    elif parsed_url.netloc in ('www.youtube.com', 'youtube.com'):
-        if parsed_url.path == '/watch':
-            return parse_qs(parsed_url.query)['v'][0]
-        elif parsed_url.path.startswith('/embed/'):
-            return parsed_url.path.split('/')[2]
-        elif parsed_url.path.startswith('/v/'):
-            return parsed_url.path.split('/')[2]
-    
-    # Return None if unable to extract ID
-    return None
-
-# Function to check if URL is a valid YouTube URL
-def is_valid_youtube_url(url):
-    youtube_regex = (
-        r'(https?://)?(www\.)?'
-        r'(youtube|youtu|youtube-nocookie)\.(com|be)/'
-        r'(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})')
-    youtube_regex_match = re.match(youtube_regex, url)
-    return bool(youtube_regex_match)
-
-# Function to display video statistics
-def display_video_stats(info):
-    if not info:
-        return
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("Video Information")
-        info_table = {
-            "Title": info.get('title', 'N/A'),
-            "Channel": info.get('uploader', 'N/A'),
-            "Duration": f"{int(info.get('duration', 0) // 60)}:{int(info.get('duration', 0) % 60):02d}",
-            "Upload Date": info.get('upload_date', 'N/A'),
-            "Views": f"{info.get('view_count', 0):,}",
-            "Likes": f"{info.get('like_count', 0):,}",
+# Fungsi download video
+def download_video(url, output_path, format_selector, audio_only=False, custom_filename=None):
+    try:
+        progress_hook = ProgressHook()
+        
+        ydl_opts = {
+            'outtmpl': os.path.join(output_path, '%(title)s.%(ext)s'),
+            'progress_hooks': [progress_hook],
+            'format': format_selector,
+            'no_warnings': True,
+            'ignoreerrors': True,
         }
         
-        df = pd.DataFrame(list(info_table.items()), columns=['Metric', 'Value'])
-        st.table(df)
+        # Setup ffmpeg path jika tersedia
+        if FFMPEG_PATH:
+            ydl_opts['ffmpeg_location'] = FFMPEG_PATH
+        
+        if custom_filename:
+            ydl_opts['outtmpl'] = os.path.join(output_path, f'{sanitize_filename(custom_filename)}.%(ext)s')
+        
+        if audio_only:
+            if FFMPEG_PATH:
+                ydl_opts['format'] = 'bestaudio/best'
+                ydl_opts['postprocessors'] = [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }]
+            else:
+                # Fallback tanpa ffmpeg
+                ydl_opts['format'] = 'bestaudio/best'
+                st.info("ℹ️ Downloading audio dalam format asli (tanpa konversi ke MP3)")
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+            
+        return True, "Download berhasil!"
+        
+    except Exception as e:
+        return False, str(e)
+
+# Sidebar untuk pengaturan
+with st.sidebar:
+    st.header("⚙️ Pengaturan Download")
+    
+    # Mode download
+    download_mode = st.selectbox(
+        "Mode Download",
+        ["Single Video", "Playlist", "Audio Only", "Batch URLs"]
+    )
+    
+    # Kualitas video
+    quality_preset = st.selectbox(
+        "Preset Kualitas",
+        ["Best Quality", "High (1080p)", "Medium (720p)", "Low (480p)", "Custom"]
+    )
+    
+    # Format output
+    output_format = st.selectbox(
+        "Format Output",
+        ["mp4", "webm", "mkv", "avi", "mov"]
+    )
+    
+    # Opsi audio
+    st.subheader("🔊 Opsi Audio")
+    extract_audio = st.checkbox("Ekstrak audio terpisah")
+    audio_format = st.selectbox("Format Audio", ["mp3", "aac", "ogg", "wav"]) if extract_audio else None
+    
+    # Opsi subtitle
+    st.subheader("📝 Subtitle")
+    download_subs = st.checkbox("Download subtitle")
+    auto_subs = st.checkbox("Subtitle otomatis") if download_subs else False
+    
+    # Opsi lanjutan
+    st.subheader("🔧 Opsi Lanjutan")
+    custom_filename = st.text_input("Nama file custom (opsional)")
+    embed_subs = st.checkbox("Embed subtitle ke video") if download_subs else False
+    
+    # Rentang waktu
+    use_time_range = st.checkbox("Potong video (rentang waktu)")
+    if use_time_range:
+        col1, col2 = st.columns(2)
+        with col1:
+            start_time = st.text_input("Waktu mulai (HH:MM:SS)", "00:00:00")
+        with col2:
+            end_time = st.text_input("Waktu selesai (HH:MM:SS)", "")
+
+# Area utama
+col1, col2 = st.columns([2, 1])
+
+with col1:
+    st.header("🎬 Input Video")
+    
+    if download_mode == "Single Video":
+        video_url = st.text_input(
+            "Masukkan URL YouTube:",
+            placeholder="https://www.youtube.com/watch?v=..."
+        )
+    elif download_mode == "Playlist":
+        video_url = st.text_input(
+            "Masukkan URL Playlist:",
+            placeholder="https://www.youtube.com/playlist?list=..."
+        )
+        playlist_start = st.number_input("Video mulai dari", min_value=1, value=1)
+        playlist_end = st.number_input("Video sampai", min_value=1, value=100)
+    elif download_mode == "Batch URLs":
+        video_urls = st.text_area(
+            "Masukkan multiple URLs (satu per baris):",
+            height=100,
+            placeholder="https://www.youtube.com/watch?v=...\nhttps://www.youtube.com/watch?v=..."
+        )
+    else:  # Audio Only
+        video_url = st.text_input(
+            "Masukkan URL untuk download audio:",
+            placeholder="https://www.youtube.com/watch?v=..."
+        )
+
+with col2:
+    st.header("📊 Info Video")
+    info_placeholder = st.empty()
+
+# Preview video info
+if 'video_url' in locals() and video_url:
+    with st.spinner("Mengambil informasi video..."):
+        video_info = get_video_info(video_url)
+        
+        if video_info:
+            with info_placeholder.container():
+                st.image(video_info.get('thumbnail', ''), width=300)
+                st.write(f"**Judul:** {video_info.get('title', 'N/A')}")
+                st.write(f"**Channel:** {video_info.get('uploader', 'N/A')}")
+                st.write(f"**Durasi:** {video_info.get('duration', 0)} detik")
+                st.write(f"**Views:** {video_info.get('view_count', 'N/A'):,}")
+                st.write(f"**Upload Date:** {video_info.get('upload_date', 'N/A')}")
+                
+                # Format yang tersedia
+                if quality_preset == "Custom":
+                    formats = get_available_formats(video_info)
+                    if formats:
+                        st.write("**Format tersedia:**")
+                        format_options = []
+                        for f in formats[:10]:  # Batasi 10 format teratas
+                            size_mb = f['filesize'] / (1024*1024) if f['filesize'] else 0
+                            format_str = f"{f['resolution']}p {f['ext']} ({size_mb:.1f}MB)" if size_mb > 0 else f"{f['resolution']}p {f['ext']}"
+                            format_options.append((format_str, f['format_id']))
+                        
+                        selected_format = st.selectbox(
+                            "Pilih format:",
+                            options=[opt[0] for opt in format_options]
+                        )
+
+# Area download
+st.header("⬇️ Download")
+
+# Tombol download
+col1, col2, col3 = st.columns([1, 1, 2])
+
+with col1:
+    download_btn = st.button("🚀 Mulai Download", type="primary", use_container_width=True)
+
+with col2:
+    if st.button("📋 Clear All", use_container_width=True):
+        st.rerun()
+
+# Progress area
+progress_container = st.container()
+
+if download_btn:
+    if download_mode == "Single Video" and video_url:
+        with progress_container:
+            st.markdown('<div class="download-progress">', unsafe_allow_html=True)
+            st.write("🔄 Memulai download...")
+            
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            # Tentukan format selector
+            if quality_preset == "Best Quality":
+                format_selector = "best"
+            elif quality_preset == "High (1080p)":
+                format_selector = "best[height<=1080]"
+            elif quality_preset == "Medium (720p)":
+                format_selector = "best[height<=720]"
+            elif quality_preset == "Low (480p)":
+                format_selector = "best[height<=480]"
+            else:  # Custom
+                if 'selected_format' in locals():
+                    # Cari format_id yang sesuai
+                    for opt in format_options:
+                        if opt[0] == selected_format:
+                            format_selector = opt[1]
+                            break
+                else:
+                    format_selector = "best"
+            
+            # Buat temporary directory
+            with tempfile.TemporaryDirectory() as temp_dir:
+                # Setup progress hook
+                progress_hook = ProgressHook()
+                progress_hook.set_streamlit_elements(progress_bar, status_text)
+                
+                # Download
+                success, message = download_video(
+                    video_url, 
+                    temp_dir, 
+                    format_selector,
+                    audio_only=(download_mode == "Audio Only"),
+                    custom_filename=custom_filename if custom_filename else None
+                )
+                
+                if success:
+                    st.markdown('<div class="success-box">✅ Download berhasil!</div>', unsafe_allow_html=True)
+                    
+                    # List file yang didownload
+                    downloaded_files = list(Path(temp_dir).glob("*"))
+                    
+                    if downloaded_files:
+                        st.write("📁 **File yang didownload:**")
+                        
+                        for file_path in downloaded_files:
+                            file_size = file_path.stat().st_size / (1024*1024)  # MB
+                            st.write(f"- {file_path.name} ({file_size:.1f} MB)")
+                            
+                            # Tombol download individual
+                            with open(file_path, "rb") as f:
+                                st.download_button(
+                                    label=f"⬇️ Download {file_path.name}",
+                                    data=f.read(),
+                                    file_name=file_path.name,
+                                    mime="application/octet-stream"
+                                )
+                        
+                        # Download semua sebagai ZIP jika lebih dari 1 file
+                        if len(downloaded_files) > 1:
+                            zip_buffer = io.BytesIO()
+                            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                                for file_path in downloaded_files:
+                                    zip_file.write(file_path, file_path.name)
+                            zip_buffer.seek(0)
+                            
+                            st.download_button(
+                                label="📦 Download All as ZIP",
+                                data=zip_buffer.getvalue(),
+                                file_name=f"youtube_download_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                                mime="application/zip"
+                            )
+                else:
+                    st.markdown(f'<div class="error-box">❌ Error: {message}</div>', unsafe_allow_html=True)
+            
+            st.markdown('</div>', unsafe_allow_html=True)
+    
+    elif download_mode == "Batch URLs" and 'video_urls' in locals() and video_urls:
+        urls = [url.strip() for url in video_urls.split('\n') if url.strip()]
+        
+        if urls:
+            st.write(f"🔄 Memproses {len(urls)} URL...")
+            
+            with tempfile.TemporaryDirectory() as temp_dir:
+                all_files = []
+                
+                for i, url in enumerate(urls):
+                    st.write(f"📥 Download {i+1}/{len(urls)}: {url}")
+                    progress_bar = st.progress((i) / len(urls))
+                    
+                    success, message = download_video(url, temp_dir, "best")
+                    
+                    if success:
+                        st.success(f"✅ Berhasil: {url}")
+                    else:
+                        st.error(f"❌ Gagal: {url} - {message}")
+                
+                progress_bar.progress(1.0)
+                
+                # List semua file
+                downloaded_files = list(Path(temp_dir).glob("*"))
+                all_files.extend(downloaded_files)
+                
+                if downloaded_files:
+                    st.write("📁 **Semua file yang didownload:**")
+                    
+                    # Create ZIP dengan semua file
+                    zip_buffer = io.BytesIO()
+                    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                        for file_path in downloaded_files:
+                            zip_file.write(file_path, file_path.name)
+                            file_size = file_path.stat().st_size / (1024*1024)
+                            st.write(f"- {file_path.name} ({file_size:.1f} MB)")
+                    
+                    zip_buffer.seek(0)
+                    
+                    st.download_button(
+                        label="📦 Download All Files as ZIP",
+                        data=zip_buffer.getvalue(),
+                        file_name=f"batch_download_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                        mime="application/zip"
+                    )
+    else:
+        st.warning("⚠️ Silakan masukkan URL yang valid!")
+
+# Footer dengan informasi
+st.markdown("---")
+st.markdown("""
+<div class="feature-box">
+<h3>🚀 Fitur Utama:</h3>
+<ul>
+<li><strong>Multiple Download Modes:</strong> Single video, playlist, batch URLs, dan audio-only</li>
+<li><strong>Kualitas Fleksibel:</strong> Dari 480p hingga kualitas terbaik yang tersedia</li>
+<li><strong>Format Beragam:</strong> MP4, WebM, MKV, AVI, MOV</li>
+<li><strong>Audio Extraction:</strong> MP3, AAC, OGG, WAV</li>
+<li><strong>Subtitle Support:</strong> Download dan embed subtitle</li>
+<li><strong>Custom Options:</strong> Nama file custom, rentang waktu, dan lainnya</li>
+<li><strong>Batch Processing:</strong> Download multiple video sekaligus</li>
+<li><strong>Progress Tracking:</strong> Real-time progress dan speed monitoring</li>
+</ul>
+</div>
+
+<div style="text-align: center; margin-top: 2rem; color: #666;">
+<p>Powered by <strong>yt-dlp</strong> & <strong>ffmpeg</strong> | Built with ❤️ using Streamlit</p>
+<p><em>Gunakan dengan bijak dan hormati hak cipta konten creator</em></p>
+</div>
+""", unsafe_allow_html=True)
+
+# Informasi sistem (untuk debugging)
+with st.expander("🔧 System Information"):
+    col1, col2 = st.columns(2)
+    with col1:
+        st.write("**Python Packages:**")
+        try:
+            import yt_dlp
+            st.write(f"- yt-dlp: {yt_dlp.version.__version__}")
+        except:
+            st.write("- yt-dlp: Not available")
+        
+        try:
+            # Cek ffmpeg dengan cara yang aman untuk cloud
+            if FFMPEG_PATH:
+                result = subprocess.run([FFMPEG_PATH, '-version'], 
+                                      capture_output=True, text=True, timeout=5)
+                if result.returncode == 0:
+                    version_line = result.stdout.split('\n')[0]
+                    st.write(f"- ffmpeg: {version_line}")
+                else:
+                    st.write("- ffmpeg: Available but version check failed")
+            else:
+                st.write("- ffmpeg: Not available (some features limited)")
+        except Exception as e:
+            st.write(f"- ffmpeg: Error checking version ({str(e)})")
     
     with col2:
-        st.subheader("Engagement Statistics")
-        if 'view_count' in info and 'like_count' in info:
-            data = {
-                'Metric': ['Views', 'Likes'],
-                'Count': [info.get('view_count', 0), info.get('like_count', 0)]
-            }
-            fig = px.bar(data, x='Metric', y='Count', color='Metric', 
-                         color_discrete_map={'Views': 'blue', 'Likes': 'red'})
-            fig.update_layout(height=300)
-            st.plotly_chart(fig, use_container_width=True)
-
-# Function to extract and display playlist info
-def handle_playlist(url):
-    ydl_opts = {
-        'quiet': True,
-        'extract_flat': True,
-    }
-    
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        try:
-            info = ydl.extract_info(url, download=False)
-            
-            if 'entries' in info:
-                st.subheader(f"Playlist: {info.get('title', 'Unknown')}")
-                st.write(f"Total videos: {len(info['entries'])}")
-                
-                # Create a DataFrame for the playlist
-                playlist_data = []
-                for index, entry in enumerate(info['entries']):
-                    playlist_data.append({
-                        'Index': index + 1,
-                        'Title': entry.get('title', 'Unknown'),
-                        'URL': f"https://www.youtube.com/watch?v={entry.get('id')}",
-                    })
-                
-                playlist_df = pd.DataFrame(playlist_data)
-                st.dataframe(playlist_df)
-                
-                # Option to download the entire playlist
-                if st.button("Download Entire Playlist"):
-                    download_playlist(url)
-                
-                return True
-            
-            return False
-        
-        except yt_dlp.utils.DownloadError as e:
-            st.error(f"Error: {str(e)}")
-            return False
-
-# Function to download a playlist
-def download_playlist(url):
-    temp_dir = tempfile.mkdtemp()
-    output_template = os.path.join(temp_dir, "%(playlist_title)s/%(playlist_index)s - %(title)s.%(ext)s")
-    
-    ydl_opts = {
-        'outtmpl': output_template,
-        'quiet': False,
-        'no_warnings': True,
-        'format': 'best',
-    }
-    
-    with st.spinner("Downloading playlist..."):
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            try:
-                ydl.download([url])
-                st.success("Playlist downloaded successfully!")
-                st.info("Note: Playlist download is for demonstration purposes. In a production app, you would need to create a zip file of the downloads and provide a download link.")
-            except yt_dlp.utils.DownloadError as e:
-                st.error(f"Error downloading playlist: {str(e)}")
-
-# Main app
-def main():
-    st.markdown("<h1 class='main-header'>YouTube Downloader Pro</h1>", unsafe_allow_html=True)
-    st.markdown("<p class='sub-header'>Download videos, audio, and playlists with advanced options</p>", unsafe_allow_html=True)
-    
-    # Setup dependencies
-    setup_dependencies()
-    
-    # Sidebar with app info
-    with st.sidebar:
-        st.image("https://upload.wikimedia.org/wikipedia/commons/e/ef/Youtube_logo.png", width=200)
-        st.title("Features")
-        st.markdown("""
-        - 🎬 Download videos in various formats and qualities
-        - 🎵 Extract audio from videos
-        - ✂️ Trim videos to specific timestamps
-        - 📋 Support for playlists
-        - 📊 Video statistics and information
-        - 🖼️ Download video thumbnails
-        """)
-        
-        st.title("How to Use")
-        st.markdown("""
-        1. Paste a YouTube video or playlist URL
-        2. Select download options
-        3. Click download and wait for processing
-        4. Click the download link when ready
-        """)
-        
-        st.caption("Made with ❤️ using Streamlit, yt-dlp, and ffmpeg")
-    
-    # Main content
-    url = st.text_input("Enter YouTube URL:", placeholder="https://www.youtube.com/watch?v=...")
-    
-    if url:
-        if not is_valid_youtube_url(url):
-            st.error("Please enter a valid YouTube URL")
-        else:
-            # Check if it's a playlist
-            if "playlist" in url or "list=" in url:
-                is_playlist = handle_playlist(url)
-                if is_playlist:
-                    st.write("---")
-                    st.write("You can also download individual videos from the playlist by pasting their URL above.")
-                    return
-            
-            # Get video info
-            with st.spinner("Fetching video information..."):
-                info = get_video_info(url)
-                
-                if info:
-                    # Extract video ID for thumbnail
-                    video_id = extract_video_id(url)
-                    if video_id:
-                        thumbnail_url = f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg"
-                        st.image(thumbnail_url, use_column_width=True)
-                    
-                    # Display basic video info
-                    st.title(info.get('title', 'Unknown Title'))
-                    st.write(f"By: {info.get('uploader', 'Unknown uploader')}")
-                    
-                    # Show tabs for different download options
-                    tab1, tab2, tab3, tab4 = st.tabs(["📹 Video", "🎵 Audio", "✂️ Advanced", "📊 Stats"])
-                    
-                    # Video tab
-                    with tab1:
-                        st.header("Download Video")
-                        
-                        # Get available formats
-                        formats = []
-                        if 'formats' in info:
-                            for f in info['formats']:
-                                if f.get('resolution') != 'audio only' and f.get('ext') in ['mp4', 'webm', 'mkv']:
-                                    format_info = f"{f.get('format_id')} - {f.get('ext')} - {f.get('resolution')} - {f.get('fps', 'N/A')}fps"
-                                    formats.append((f.get('format_id'), format_info))
-                        
-                        # Video quality options
-                        quality_col, format_col = st.columns(2)
-                        
-                        with quality_col:
-                            quality = st.radio("Select video quality:", ["best", "medium", "low"])
-                        
-                        with format_col:
-                            video_format = st.selectbox("Select output format:", ["mp4", "mkv", "webm", "avi"])
-                        
-                        # Option to select specific format
-                        use_specific_format = st.checkbox("Use specific format (advanced)")
-                        if use_specific_format and formats:
-                            format_id = st.selectbox(
-                                "Select specific format:",
-                                options=[f[0] for f in formats],
-                                format_func=lambda x: next((f[1] for f in formats if f[0] == x), x)
-                            )
-                        else:
-                            format_id = None
-                        
-                        # Download button
-                        if st.button("Download Video"):
-                            global progress_bar, download_status
-                            progress_bar = st.progress(0)
-                            download_status = st.empty()
-                            
-                            downloaded_file, download_info = download_media(
-                                url, 
-                                "video", 
-                                format_id=format_id, 
-                                quality=quality, 
-                                video_format=video_format
-                            )
-                            
-                            if downloaded_file:
-                                st.markdown(get_download_link(downloaded_file, "Download Video", "video"), unsafe_allow_html=True)
-                    
-                    # Audio tab
-                    with tab2:
-                        st.header("Download Audio")
-                        
-                        audio_format = st.selectbox("Select audio format:", ["mp3", "m4a", "wav", "flac", "ogg"])
-                        
-                        # Download button
-                        if st.button("Download Audio"):
-                            global progress_bar, download_status
-                        
+        st.write("**Supported Sites:**")
+        st.write("- YouTube (videos & playlists)")
+        st.write("- YouTube Music")  
+        st.write("- Instagram")
+        st.write("- TikTok")
+        st.write("- Twitter/X")
+        st.write("- Facebook")
+        st.write("- Dan 1000+ site lainnya!")
