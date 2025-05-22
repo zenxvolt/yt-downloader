@@ -1,4 +1,8 @@
 streamlit
 yt-dlp
-pandas
-plotly
+requests
+urllib3
+certifi
+brotli
+pycryptodomex
+websockets
