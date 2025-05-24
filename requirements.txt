@@ -1,8 +1,5 @@
 streamlit
 yt-dlp
 requests
-urllib3
-certifi
-brotli
-pycryptodomex
-websockets
+pathlib
+datetime
