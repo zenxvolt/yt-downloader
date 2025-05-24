@@ -143,17 +143,31 @@ class YouTubeDownloader:
         self.setup_ydl_opts()
     
     def setup_ydl_opts(self):
-        """Setup yt-dlp options"""
+        """Setup yt-dlp options with HD support"""
         ffmpeg_path = FFmpegManager.get_ffmpeg_path()
         
         self.base_opts = {
             'quiet': False,
             'no_warnings': False,
             'extract_flat': False,
+            # Enable merging of video and audio for HD formats
+            'format': 'best[height<=1080]/best',
+            'merge_output_format': 'mp4',
+            # Prefer free formats
+            'prefer_free_formats': True,
+            # Add headers to avoid some blocks
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
         }
         
         if ffmpeg_path:
             self.base_opts['ffmpeg_location'] = ffmpeg_path
+            # Enable post-processing for format conversion
+            self.base_opts['postprocessors'] = [{
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': 'mp4',
+            }]
     
     def get_video_info(self, url):
         """Get comprehensive video information"""
@@ -168,68 +182,106 @@ class YouTubeDownloader:
             return None
     
     def get_available_formats(self, info):
-        """Get and organize available formats"""
+        """Get and organize available formats with HD support"""
         if not info or 'formats' not in info:
-            return {'video': [], 'audio': []}
+            return {'video': [], 'audio': [], 'combined': []}
         
         video_formats = []
         audio_formats = []
+        combined_formats = []
         seen_video = set()
         seen_audio = set()
+        seen_combined = set()
         
         for fmt in info['formats']:
-            # Video formats (with audio)
-            if (fmt.get('vcodec') != 'none' and 
-                fmt.get('acodec') != 'none' and 
-                fmt.get('height')):
-                
-                height = fmt.get('height', 0)
-                ext = fmt.get('ext', 'mp4')
-                fps = fmt.get('fps', 30)
-                filesize = fmt.get('filesize') or fmt.get('filesize_approx', 0)
-                vcodec = fmt.get('vcodec', 'unknown')
-                
-                quality_key = f"{height}p_{ext}"
-                if quality_key not in seen_video:
-                    video_formats.append({
-                        'format_id': fmt['format_id'],
+            format_id = fmt.get('format_id', '')
+            height = fmt.get('height', 0)
+            width = fmt.get('width', 0)
+            ext = fmt.get('ext', 'mp4')
+            fps = fmt.get('fps', 30)
+            filesize = fmt.get('filesize') or fmt.get('filesize_approx', 0)
+            vcodec = fmt.get('vcodec', 'unknown')
+            acodec = fmt.get('acodec', 'unknown')
+            
+            # Combined video+audio formats (older/lower quality)
+            if (vcodec != 'none' and acodec != 'none' and height > 0):
+                quality_key = f"{height}p_combined"
+                if quality_key not in seen_combined and height <= 720:  # Usually combined formats are lower quality
+                    combined_formats.append({
+                        'format_id': format_id,
                         'quality': f"{height}p",
                         'ext': ext,
                         'fps': fps,
                         'filesize': filesize,
-                        'vcodec': vcodec[:10],
-                        'display': f"{height}p ({ext}) - {self.format_bytes(filesize)}"
+                        'type': 'combined',
+                        'display': f"{height}p Combined ({ext}) - {self.format_bytes(filesize)}"
+                    })
+                    seen_combined.add(quality_key)
+            
+            # High-quality video-only formats
+            elif (vcodec != 'none' and acodec == 'none' and height > 0):
+                quality_key = f"{height}p_video"
+                if quality_key not in seen_video:
+                    # Create format specifier for video+best audio
+                    format_spec = f"{format_id}+bestaudio"
+                    
+                    video_formats.append({
+                        'format_id': format_spec,
+                        'quality': f"{height}p",
+                        'ext': ext,
+                        'fps': fps,
+                        'filesize': filesize,
+                        'vcodec': vcodec[:15],
+                        'type': 'video+audio',
+                        'display': f"{height}p HD ({ext}) - {self.format_bytes(filesize)} + Audio"
                     })
                     seen_video.add(quality_key)
             
             # Audio-only formats
-            elif (fmt.get('acodec') != 'none' and 
-                  fmt.get('vcodec') == 'none'):
-                
+            elif (acodec != 'none' and vcodec == 'none'):
                 abr = fmt.get('abr', 0)
-                ext = fmt.get('ext', 'mp3')
-                filesize = fmt.get('filesize') or fmt.get('filesize_approx', 0)
-                acodec = fmt.get('acodec', 'unknown')
-                
                 quality_key = f"{abr}kbps_{ext}"
                 if quality_key not in seen_audio and abr:
                     audio_formats.append({
-                        'format_id': fmt['format_id'],
+                        'format_id': format_id,
                         'quality': f"{int(abr)}kbps",
                         'ext': ext,
                         'filesize': filesize,
-                        'acodec': acodec[:10],
+                        'acodec': acodec[:15],
+                        'type': 'audio',
                         'display': f"Audio {int(abr)}kbps ({ext}) - {self.format_bytes(filesize)}"
                     })
                     seen_audio.add(quality_key)
         
-        # Sort formats
+        # Sort formats by quality (highest first)
         video_formats.sort(key=lambda x: int(x['quality'][:-1]), reverse=True)
+        combined_formats.sort(key=lambda x: int(x['quality'][:-1]), reverse=True)
         audio_formats.sort(key=lambda x: int(x['quality'][:-4]), reverse=True)
         
+        # Add some preset format options for convenience
+        preset_formats = []
+        if any(fmt for fmt in video_formats if int(fmt['quality'][:-1]) >= 1080):
+            preset_formats.append({
+                'format_id': 'best[height<=1080]',
+                'quality': 'Best ≤1080p',
+                'ext': 'mp4',
+                'type': 'preset',
+                'display': 'Best quality ≤1080p (Recommended)'
+            })
+        
+        preset_formats.append({
+            'format_id': 'best[height<=720]',
+            'quality': 'Best ≤720p',
+            'ext': 'mp4', 
+            'type': 'preset',
+            'display': 'Best quality ≤720p (Fast)'
+        })
+        
         return {
-            'video': video_formats[:10],  # Top 10 video formats
-            'audio': audio_formats[:5]    # Top 5 audio formats
+            'preset': preset_formats,
+            'video': video_formats[:15],  # Top 15 video formats
+            'combined': combined_formats[:5],  # Top 5 combined formats
+            'audio': audio_formats[:8]    # Top 8 audio formats
         }
     
     def format_bytes(self, bytes_val):
@@ -297,7 +349,7 @@ class YouTubeDownloader:
                 progress_placeholder.progress(1.0)
                 status_placeholder.success("✅ Download completed!")
         
-        # Setup download options
+        # Setup download options with better format handling
         filename_template = '%(title)s.%(ext)s'
         if custom_name:
             filename_template = f'{custom_name}.%(ext)s'
@@ -307,6 +359,13 @@ class YouTubeDownloader:
             'format': format_id,
             'outtmpl': os.path.join(self.output_path, filename_template),
             'progress_hooks': [progress_hook],
+            # Ensure we merge video+audio when needed
+            'merge_output_format': 'mp4',
+            # Add post-processors for better compatibility
+            'postprocessors': [{
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': 'mp4',
+            }] if FFmpegManager.get_ffmpeg_path() else []
         }
         
         try:
@@ -364,11 +423,29 @@ def render_sidebar():
         embed_subs = st.checkbox("Embed Subtitles", help="Embed subtitles into video")
         embed_thumbnail = st.checkbox("Embed Thumbnail", help="Embed thumbnail as cover art")
         
+        # Quality settings
+        st.subheader("🎯 Quality Settings")
+        max_quality = st.selectbox(
+            "Maximum Quality",
+            ["No Limit", "4K (2160p)", "1440p", "1080p", "720p", "480p"],
+            index=2,  # Default to 1080p
+            help="Set maximum video quality to download"
+        )
+        
+        prefer_format = st.selectbox(
+            "Prefer Format",
+            ["MP4 (Recommended)", "WebM", "Any"],
+            help="Preferred video container format"
+        )
+        
         # System info
         st.subheader("🖥️ System Info")
         ffmpeg_status = "✅ Available" if st.session_state.ffmpeg_setup else "❌ Not Found"
         st.write(f"FFmpeg: {ffmpeg_status}")
         st.write(f"Platform: {platform.system()}")
+        
+        if not st.session_state.ffmpeg_setup:
+            st.warning("⚠️ FFmpeg not available. HD video merging may be limited.")
         
         return {
             'custom_name': custom_name,
@@ -376,7 +453,9 @@ def render_sidebar():
             'audio_format': audio_format if download_type == "Audio Only" else None,
             'audio_quality': audio_quality if download_type == "Audio Only" else None,
             'embed_subs': embed_subs,
-            'embed_thumbnail': embed_thumbnail
+            'embed_thumbnail': embed_thumbnail,
+            'max_quality': max_quality,
+            'prefer_format': prefer_format
         }
 
 def render_main_content(settings):
@@ -452,212 +531,27 @@ def render_format_selection(info, downloader, settings, url):
     
     formats = downloader.get_available_formats(info)
     
+    # Organize formats by type
     if settings['download_type'] == "Audio Only":
         available_formats = formats['audio']
         format_type = "Audio"
+        st.info("🎵 Audio-only formats selected")
+    elif settings['download_type'] == "Video Only":
+        available_formats = formats['video']
+        format_type = "Video (No Audio)"
+        st.warning("📹 Video-only formats (no audio track)")
     else:
-        available_formats = formats['video'] + formats['audio']
-        format_type = "Video/Audio"
+        # Combine all video formats for "Video + Audio"
+        available_formats = (formats.get('preset', []) + 
+                           formats.get('video', []) + 
+                           formats.get('combined', []))
+        format_type = "Video + Audio"
+        st.success("🎬 Video with audio formats")
     
     if not available_formats:
-        st.error("❌ No compatible formats found")
+        st.error("❌ No compatible formats found for the selected type")
         return
     
-    # Format selection
-    format_options = [fmt['display'] for fmt in available_formats]
-    
-    selected_idx = st.selectbox(
-        f"Choose {format_type} Format:",
-        range(len(format_options)),
-        format_func=lambda x: format_options[x]
-    )
-    
-    selected_format = available_formats[selected_idx]
-    
-    # Format details
-    col_detail1, col_detail2, col_detail3 = st.columns(3)
-    
-    with col_detail1:
-        st.metric("Quality", selected_format['quality'])
-    with col_detail2:
-        st.metric("Format", selected_format['ext'].upper())
-    with col_detail3:
-        st.metric("Size", downloader.format_bytes(selected_format['filesize']))
-    
-    # Download buttons
-    st.markdown("### ⬇️ Download Options")
-    
-    col_btn1, col_btn2, col_btn3 = st.columns(3)
-    
-    with col_btn1:
-        if st.button("🚀 Download Now", type="primary", use_container_width=True):
-            start_download(url, selected_format, downloader, settings, info)
-    
-    with col_btn2:
-        if st.button("📋 Copy Video Info", use_container_width=True):
-            video_info_text = f"""
-Title: {info.get('title', 'Unknown')}
-Channel: {info.get('uploader', 'Unknown')}
-URL: {url}
-Duration: {info.get('duration_string', 'Unknown')}
-Views: {info.get('view_count', 0):,}
-            """
-            st.code(video_info_text.strip())
-    
-    with col_btn3:
-        if st.button("🔄 Refresh", use_container_width=True):
-            st.rerun()
-
-def start_download(url, format_info, downloader, settings, video_info):
-    """Start the download process"""
-    st.markdown("### 📥 Downloading...")
-    
-    # Add to current download
-    st.session_state.current_download = {
-        'url': url,
-        'format': format_info,
-        'settings': settings,
-        'video_info': video_info,
-        'status': 'downloading',
-        'start_time': datetime.now()
-    }
-    
-    # Perform download
-    success, result = downloader.download_with_progress(
-        url, 
-        format_info['format_id'],
-        settings.get('custom_name')
-    )
-    
-    if success:
-        # Add to history
-        st.session_state.download_history.append({
-            'title': video_info.get('title', 'Unknown'),
-            'format': format_info['display'],
-            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            'status': 'completed',
-            'filename': result
-        })
-        
-        st.success("🎉 Download completed successfully!")
-        
-        # Provide download link (if file exists and accessible)
-        if os.path.exists(result):
-            st.download_button(
-                label="💾 Download File",
-                data=open(result, 'rb').read(),
-                file_name=os.path.basename(result),
-                mime="application/octet-stream"
-            )
-    else:
-        st.error(f"❌ Download failed: {result}")
-    
-    # Clear current download
-    st.session_state.current_download = None
-
-def render_download_panel():
-    """Render download status and history panel"""
-    st.header("📊 Download Status")
-    
-    # Current download
-    if st.session_state.current_download:
-        download = st.session_state.current_download
-        
-        st.markdown("### 🔄 Currently Downloading")
-        st.write(f"**Title:** {download['video_info']['title'][:40]}...")
-        st.write(f"**Format:** {download['format']['display']}")
-        st.write(f"**Started:** {download['start_time'].strftime('%H:%M:%S')}")
-        
-        # This would show real progress in actual implementation
-        with st.spinner("Downloading in progress..."):
-            pass
-    
-    # Download history
-    if st.session_state.download_history:
-        st.markdown("### 📜 Recent Downloads")
-        
-        for i, item in enumerate(reversed(st.session_state.download_history[-5:])):
-            status_color = "status-completed" if item['status'] == 'completed' else "status-error"
-            
-            with st.expander(f"📄 {item['title'][:30]}..."):
-                st.write(f"**Format:** {item['format']}")
-                st.write(f"**Time:** {item['timestamp']}")
-                st.markdown(f"**Status:** <span class='{status_color}'>{item['status'].title()}</span>", 
-                           unsafe_allow_html=True)
-                
-                col_hist1, col_hist2 = st.columns(2)
-                with col_hist1:
-                    if st.button("🗑️ Remove", key=f"remove_{i}"):
-                        st.session_state.download_history.remove(item)
-                        st.rerun()
-                with col_hist2:
-                    if st.button("📋 Copy Info", key=f"copy_{i}"):
-                        st.code(f"Title: {item['title']}\nFormat: {item['format']}\nTime: {item['timestamp']}")
-    else:
-        st.info("📭 No downloads yet")
-
-def render_features():
-    """Render features section"""
-    st.markdown("---")
-    st.header("✨ Features & Capabilities")
-    
-    col1, col2, col3, col4 = st.columns(4)
-    
-    features = [
-        ("🎥", "HD Video Download", "Download videos up to 4K quality"),
-        ("🎵", "Audio Extraction", "High-quality MP3, FLAC, M4A"),
-        ("⚡", "Fast Processing", "Optimized with yt-dlp engine"),
-        ("☁️", "Cloud Ready", "Deployed on Streamlit Cloud")
-    ]
-    
-    for i, (icon, title, desc) in enumerate(features):
-        with [col1, col2, col3, col4][i]:
-            st.markdown(f"""
-            <div class="feature-box">
-                <h3 style="margin:0; color:#333;">{icon} {title}</h3>
-                <p style="margin:0.5rem 0 0 0; color:#666;">{desc}</p>
-            </div>
-            """, unsafe_allow_html=True)
-    
-    # Technical details
-    with st.expander("🔧 Technical Information"):
-        st.markdown("""
-        ### System Requirements:
-        - **Python 3.8+** with required packages
-        - **yt-dlp** for YouTube processing
-        - **FFmpeg** for media processing (auto-configured)
-        
-        ### Supported Formats:
-        **Video:** MP4, WebM, AVI, MKV  
-        **Audio:** MP3, M4A, WAV, FLAC, OGG
-        
-        ### Cloud Deployment:
-        This app is optimized for **Streamlit Cloud** with automatic dependency management.
-        """)
-
-def render_footer():
-    """Render footer"""
-    st.markdown("---")
-    st.markdown("""
-    <div style="text-align: center; padding: 2rem; color: #666;">
-        <h4>📺 YouTube Downloader Pro</h4>
-        <p>Built with ❤️ using <strong>Streamlit</strong> & <strong>yt-dlp</strong></p>
-        <p><small>⚠️ Please respect copyright laws and YouTube's Terms of Service</small></p>
-        <p><small>🌟 Star this project if you find it useful!</small></p>
-    </div>
-    """, unsafe_allow_html=True)
-
-def main():
-    """Main application function"""
-    # Initialize
-    init_session_state()
-    
-    # Render components
-    render_header()
-    settings = render_sidebar()
-    render_main_content(settings)
-    render_features()
-    render_footer()
-
-if __name__ == "__main__":
-    main()
+    # Format selection with categories
+    format_options = []
+    format_categories = []
